@@ -62,46 +62,62 @@ Run tests with output:
 cargo test -- --nocapture
 ```
 
-### Optimized Builds
 
-For production deployment:
+### Prerequisites
+
+- Rust toolchain (1.74.0+)
+- Soroban CLI: `cargo install --locked soroban-cli`
+- wasm32-unknown-unknown target: `rustup target add wasm32-unknown-unknown`
+
+### Tooling & Automation
+
+#### Makefile Targets
+
+Run all contract operations from the `contracts` directory:
 
 ```bash
-cargo build --target wasm32-unknown-unknown --release
-soroban contract optimize --wasm target/wasm32-unknown-unknown/release/*.wasm
+make build           # Compile contract WASM
+make test            # Run contract tests
+make optimize        # Optimize WASM for deployment
+make fmt             # Format Rust code
+make clippy          # Lint contract code
+make deploy-testnet  # Deploy contract to Soroban testnet
 ```
 
-## Contract Stability
+#### Scripts
 
-### Immutability Policy
+- `scripts/deploy.sh`: Deploys contract to Soroban testnet, funds account, outputs contract ID to `contract-deployment.json`.
+- `scripts/setup-local.sh`: Sets up local Soroban sandbox and funds deployer account.
 
-- Deployed contracts are **immutable** once audited
-- Upgrades must go through proxy pattern
-- Breaking changes require new contract deployment
-- No forced upgrades - users opt-in
+#### Example Workflow
 
-### Upgrade Path
+1. Build and optimize contract:
+  ```bash
+  make build
+  make optimize
+  ```
+2. Setup local sandbox (optional):
+  ```bash
+  bash scripts/setup-local.sh
+  ```
+3. Deploy to testnet:
+  ```bash
+  make deploy-testnet
+  ```
+  - Contract ID will be written to `contract-deployment.json`.
 
-1. Deploy new contract version
-2. Announce upgrade window
-3. Users upgrade voluntarily
-4. Old contracts remain functional
+#### Environment Variables
 
-## Architecture
+- `DEPLOYER_SECRET`: Set your deployer account secret for deployment scripts.
 
-### Account Contract
+#### Manual Steps (for reference)
 
-The core contract that represents a smart account:
-
-- Stores owner address
-- Validates transactions
-- Executes operations
-- Manages session keys
-
-### Validation Modules
-
-Pluggable signature validation:
-
+You can still use Soroban CLI directly for custom deployments:
+```bash
+soroban contract build
+soroban contract optimize --wasm target/wasm32-unknown-unknown/release/ancore_account.wasm
+soroban contract deploy --wasm target/wasm32-unknown-unknown/release/ancore_account.optimized.wasm --source <deployer> --network testnet
+```
 - Ed25519 validation (native Stellar)
 - Multi-signature
 - WebAuthn support
