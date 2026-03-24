@@ -45,49 +45,37 @@ describe('SecureStorageManager - Master Salt Initialization', () => {
 
   describe('initializeMasterSalt', () => {
     it('should generate and store a 16-byte master salt', async () => {
-      // Access the private method via reflection for testing
-      const initializeMasterSalt = (manager as any).initializeMasterSalt.bind(manager);
-      
-      const masterSalt = await initializeMasterSalt();
-      
-      // Verify the returned value is a Uint8Array of 16 bytes
-      expect(masterSalt).toBeInstanceOf(Uint8Array);
-      expect(masterSalt.length).toBe(16);
-      
-      // Verify it was stored in the storage adapter
-      const storedSalt = await storage.get('master_salt');
-      expect(storedSalt).toBeDefined();
-      expect(typeof storedSalt).toBe('string');
-      
-      // Verify the stored value is valid base64
-      const decodedSalt = Buffer.from(storedSalt, 'base64');
-      expect(decodedSalt.length).toBe(16);
-      
-      // Verify the stored value matches the returned value
-      expect(Buffer.from(masterSalt).toString('base64')).toBe(storedSalt);
-    });
+    // initializeMasterSalt now only generates in memory — storage is handled by unlock()
+    const initializeMasterSalt = (manager as any).initializeMasterSalt.bind(manager);
 
-    it('should generate different salts on multiple calls', async () => {
+    const masterSalt = initializeMasterSalt();
+
+    // Verify the returned value is a Uint8Array of 16 bytes
+    expect(masterSalt).toBeInstanceOf(Uint8Array);
+    expect(masterSalt.length).toBe(16);
+  
+  });
+
+    it('should generate different salts on multiple calls', () => {
       const initializeMasterSalt = (manager as any).initializeMasterSalt.bind(manager);
-      
-      const salt1 = await initializeMasterSalt();
-      const salt2 = await initializeMasterSalt();
+
+      const salt1 = initializeMasterSalt();
+      const salt2 = initializeMasterSalt();
       
       // Verify they are different
       expect(Buffer.from(salt1).toString('base64')).not.toBe(Buffer.from(salt2).toString('base64'));
     });
 
-    it('should store the salt as a valid base64 string', async () => {
-      const initializeMasterSalt = (manager as any).initializeMasterSalt.bind(manager);
-      
-      await initializeMasterSalt();
-      
-      const storedSalt = await storage.get('master_salt');
-      
-      // Verify it's a valid base64 string by decoding it
-      expect(() => {
-        const decoded = Buffer.from(storedSalt, 'base64');
-        expect(decoded.length).toBe(16);
+    it('should store the salt as a valid base64 string', () => {
+  // initializeMasterSalt now returns the salt directly — verify it's encodable as base64
+  const initializeMasterSalt = (manager as any).initializeMasterSalt.bind(manager);
+
+  const masterSalt = initializeMasterSalt();
+
+    expect(() => {
+      const base64 = Buffer.from(masterSalt).toString('base64');
+      const decoded = Buffer.from(base64, 'base64');
+      expect(decoded.length).toBe(16);
       }).not.toThrow();
     });
   });
@@ -102,10 +90,11 @@ describe('SecureStorageManager - Master Salt Initialization', () => {
     });
 
     it('should load and decode existing master salt from storage', async () => {
-      // First, initialize a master salt
+      // Generate salt and manually persist it (as unlock() would do)
       const initializeMasterSalt = (manager as any).initializeMasterSalt.bind(manager);
-      const originalSalt = await initializeMasterSalt();
-      
+      const originalSalt = initializeMasterSalt();
+      await storage.set('master_salt', Buffer.from(originalSalt).toString('base64'));
+
       // Now load it back
       const loadMasterSalt = (manager as any).loadMasterSalt.bind(manager);
       const loadedSalt = await loadMasterSalt();

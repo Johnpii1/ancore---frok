@@ -48,16 +48,17 @@ export class SecureStorageManager {
     let masterSalt = await this.loadMasterSalt();
     
     if (!masterSalt) {
-      // First run: generate and store master salt
-      masterSalt = await this.initializeMasterSalt();
-      
-      // Derive encryption key from password and master salt
-      this.encryptionKey = await this.deriveEncryptionKey(password, masterSalt);
-      
-      // Create and store verification payload
-      await this.createVerificationPayload();
-      
-      return true;
+    // First run: generate salt in memory only
+    masterSalt = this.initializeMasterSalt();
+
+    // Derive encryption key from password and master salt
+    this.encryptionKey = await this.deriveEncryptionKey(password, masterSalt);
+
+    // Store verification payload first, then persist salt last (atomic ordering)
+    await this.createVerificationPayload();
+    await this.storage.set('master_salt', bufferToBase64(masterSalt));
+
+  return true;
     } else {
       // Subsequent run: load master salt and verify password
       this.encryptionKey = await this.deriveEncryptionKey(password, masterSalt);
@@ -84,11 +85,8 @@ export class SecureStorageManager {
    * Generates a random 16-byte master salt and stores it in the storage adapter.
    * @returns The generated master salt as a Uint8Array
    */
-  private async initializeMasterSalt(): Promise<Uint8Array> {
-    const masterSalt = globalThis.crypto.getRandomValues(new Uint8Array(16));
-    const base64Salt = bufferToBase64(masterSalt.buffer);
-    await this.storage.set('master_salt', base64Salt);
-    return masterSalt;
+  private initializeMasterSalt(): Uint8Array {
+    return globalThis.crypto.getRandomValues(new Uint8Array(16));
   }
 
   /**
@@ -96,13 +94,21 @@ export class SecureStorageManager {
    * @returns The master salt as a Uint8Array, or null if it doesn't exist
    */
   private async loadMasterSalt(): Promise<Uint8Array | null> {
-    const base64Salt = await this.storage.get('master_salt');
-    if (!base64Salt || typeof base64Salt !== 'string') {
-      return null;
-    }
-    const buffer = base64ToBuffer(base64Salt);
-    return new Uint8Array(buffer);
+  const base64Salt = await this.storage.get('master_salt');
+
+  if (base64Salt == null) return null; // genuinely not initialized
+
+  if (typeof base64Salt !== 'string') {
+    throw new Error('Corrupted master_salt: expected string');
   }
+
+  const buffer = base64ToBuffer(base64Salt);
+  if (buffer.byteLength !== 16) {
+    throw new Error('Corrupted master_salt: expected 16 bytes');
+  }
+
+  return new Uint8Array(buffer);
+}
 
   /**
    * Derives an encryption key from the password and master salt using PBKDF2.
