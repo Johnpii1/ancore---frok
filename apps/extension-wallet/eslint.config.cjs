@@ -15,6 +15,9 @@ module.exports = [
         ecmaVersion: 2020,
         sourceType: 'module',
         ecmaFeatures: { jsx: true },
+        ecmaFeatures: {
+          jsx: true,
+        },
       },
       globals: {
         ...globals.browser,
@@ -24,7 +27,7 @@ module.exports = [
     },
     plugins: {
       '@typescript-eslint': tseslint,
-      'react': react,
+      react,
       'react-hooks': reactHooks,
     },
     rules: {
@@ -35,6 +38,9 @@ module.exports = [
       'react/prop-types': 'off', // Disable prop-types rule for TS
       '@typescript-eslint/no-unused-vars': ['warn', { argsIgnorePattern: '^_' }],
       'no-undef': 'off',
+      'no-undef': 'off',
+      'react/prop-types': 'off',
+      'react/react-in-jsx-scope': 'off',
       '@typescript-eslint/no-explicit-any': 'off',
       '@typescript-eslint/no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
     },
@@ -48,8 +54,9 @@ module.exports = [
     files: ['**/__tests__/**/*.{ts,tsx}', '**/*.test.{ts,tsx}', '**/*.spec.{ts,tsx}'],
     languageOptions: {
       globals: {
-        ...globals.jest,
-        vi: 'readonly',
+        ...globals.browser,
+        ...globals.node,
+        ...globals.vitest,
       },
     },
     rules: {
