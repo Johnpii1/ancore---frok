@@ -49,7 +49,7 @@ pub enum ContractError {
     InvalidSignature = 9,
     /// Invalid WASM hash provided for upgrade
     InvalidWasmHash = 10,
-    /// Invalid expiration provided for session key
+    /// Invalid expiration time provided
     InvalidExpiration = 11,
 }
 
