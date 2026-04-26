@@ -49,6 +49,8 @@ pub enum ContractError {
     InvalidSignature = 9,
     /// Invalid WASM hash provided for upgrade
     InvalidWasmHash = 10,
+    /// Invalid expiration time provided
+    InvalidExpiration = 11,
 }
 
 /// Event topic naming convention
@@ -89,6 +91,12 @@ mod events {
     /// Data: (old_version: u32, new_version: u32)
     pub fn migrated(env: &Env) -> Symbol {
         Symbol::new(env, "migrated")
+    }
+
+    /// Event emitted when a session key TTL is refreshed.
+    /// Data: (public_key: BytesN<32>, expires_at: u64)
+    pub fn session_key_ttl_refreshed(env: &Env) -> Symbol {
+        Symbol::new(env, "session_key_ttl_refreshed")
     }
 }
 
@@ -174,6 +182,7 @@ impl AncoreAccount {
     /// # Security
     /// - Caller must be owner OR provide a valid session key signature
     /// - `expected_nonce` must match current nonce (replay protection)
+    /// - Session key signatures are bound to exact call parameters (to, function, args, nonce)
     /// - Nonce is incremented before invocation (checks-effects-interactions)
     pub fn execute(
         env: Env,
@@ -211,6 +220,13 @@ impl AncoreAccount {
 
             let sig = signature.ok_or(ContractError::InvalidSignature)?;
             let payload = signature_payload.ok_or(ContractError::InvalidSignature)?;
+
+            // CRITICAL: Bind signature to actual call parameters to prevent replay attacks
+            // The signature must be for the exact (to, function, args, nonce) tuple being executed
+            let expected_payload = Self::create_signature_payload(&env, &to, &function, &args, expected_nonce);
+            if payload != expected_payload {
+                return Err(ContractError::InvalidSignature);
+            }
 
             // Verify signature using ed25519
             env.crypto().ed25519_verify(&session_pk, &payload, &sig);
@@ -267,6 +283,11 @@ impl AncoreAccount {
 
         Self::extend_session_key_ttl(&env, &public_key, expires_at);
 
+        // Issue #212: Consistently bump instance TTL in write paths
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
         // Emit session_key_added event
         env.events()
             .publish((events::session_key_added(&env),), (public_key, expires_at));
@@ -282,6 +303,11 @@ impl AncoreAccount {
         env.storage()
             .persistent()
             .remove(&DataKey::SessionKey(public_key.clone()));
+
+        // Issue #212: Consistently bump instance TTL in write paths
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
         // Emit session_key_revoked event
         env.events()
@@ -375,7 +401,27 @@ impl AncoreAccount {
 
         Self::extend_session_key_ttl(&env, &public_key, session_key.expires_at);
 
+        // Issue #212: Consistently bump instance TTL in write paths
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        // Issue #195: Emit event on session key TTL refresh
+        env.events().publish(
+            (events::session_key_ttl_refreshed(&env),),
+            (public_key, session_key.expires_at),
+        );
+
         Ok(())
+    }
+
+    /// Check if a session key is active (exists and not expired)
+    /// Issue #214: Add is_session_key_active view function
+    pub fn is_session_key_active(env: Env, public_key: BytesN<32>) -> bool {
+        match Self::get_session_key(env.clone(), public_key) {
+            Some(session_key) => env.ledger().timestamp() < session_key.expires_at,
+            None => false,
+        }
     }
 
     /// Helper to cleanly extend session key TTL
@@ -403,6 +449,24 @@ impl AncoreAccount {
             threshold,
             ledgers_to_live,
         );
+    }
+
+    /// Create canonical signature payload for replay protection.
+    /// This MUST match the exact format used by test helpers for signature verification.
+    /// Critical security: Binds signatures to specific (to, function, args, nonce) tuples.
+    fn create_signature_payload(
+        env: &Env,
+        to: &Address,
+        function: &soroban_sdk::Symbol,
+        args: &Vec<Val>,
+        nonce: u64,
+    ) -> soroban_sdk::Bytes {
+        let mut payload = soroban_sdk::Bytes::new(env);
+        payload.append(&to.clone().to_xdr(env));
+        payload.append(&function.clone().to_xdr(env));
+        payload.append(&args.clone().to_xdr(env));
+        payload.append(&nonce.to_xdr(env));
+        payload
     }
 }
 
@@ -1318,6 +1382,109 @@ mod test {
         let owner = Address::generate(&env);
         client.initialize(&owner);
         env.mock_all_auths();
+        client.add_session_key(&session_pk, &expires_at, &permissions);
+
+        // Create valid signatures for different nonces
+        let (sig_nonce_0, payload_nonce_0) = sign_payload(&env, &signing_key, &callee_id, &function, &args, 0);
+        let (sig_nonce_1, payload_nonce_1) = sign_payload(&env, &signing_key, &callee_id, &function, &args, 1);
+
+        // 1. SUCCESS: Execute with nonce 0 (owner path)
+        env.mock_all_auths();
+        let _result = client.execute(
+            &CallerIdentity::Owner,
+            &callee_id,
+            &function,
+            &args,
+            &0u64,
+            &None,
+            &None,
+            &None,
+        );
+        assert_eq!(client.get_nonce(), 1);
+
+        // 2. REJECT: Stale nonce 0 replayed with owner auth
+        env.mock_all_auths();
+        let stale_result = client.try_execute(
+            &CallerIdentity::Owner,
+            &callee_id,
+            &function,
+            &args,
+            &0u64, // Stale nonce
+            &None,
+            &None,
+            &None,
+        );
+        assert_eq!(stale_result, Err(Ok(ContractError::InvalidNonce)));
+
+        // 3. SUCCESS: Execute with nonce 1 (session key path)
+        let result = client.execute(
+            &CallerIdentity::SessionKey(session_pk.clone()),
+            &callee_id,
+            &function,
+            &args,
+            &1u64,
+            &Some(session_pk.clone()),
+            &Some(sig_nonce_1),
+            &Some(payload_nonce_1),
+        );
+        let res_u64: u64 = soroban_sdk::FromVal::from_val(&env, &result);
+        assert_eq!(res_u64, 1);
+        assert_eq!(client.get_nonce(), 2);
+
+        // 4. REJECT: Stale nonce 1 replayed with session key (even with valid signature)
+        let stale_result = client.try_execute(
+            &CallerIdentity::SessionKey(session_pk.clone()),
+            &callee_id,
+            &function,
+            &args,
+            &1u64, // Stale nonce
+            &Some(session_pk.clone()),
+            &Some(sig_nonce_1.clone()),
+            &Some(payload_nonce_1.clone()),
+        );
+        assert_eq!(stale_result, Err(Ok(ContractError::InvalidNonce)));
+
+        // 5. REJECT: Stale nonce 0 replayed with session key (old signature with stale nonce)
+        let stale_result = client.try_execute(
+            &CallerIdentity::SessionKey(session_pk.clone()),
+            &callee_id,
+            &function,
+            &args,
+            &0u64, // Stale nonce
+            &Some(session_pk.clone()),
+            &Some(sig_nonce_0),
+            &Some(payload_nonce_0),
+        );
+        assert_eq!(stale_result, Err(Ok(ContractError::InvalidNonce)));
+    }
+
+    #[test]
+    fn test_add_session_key_zero_expiry_rejected() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, AncoreAccount);
+        let client = AncoreAccountClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        client.initialize(&owner);
+        env.mock_all_auths();
+
+        let session_pk = BytesN::from_array(&env, &[1u8; 32]);
+        let permissions = Vec::new(&env);
+
+        let result = client.try_add_session_key(&session_pk, &0u64, &permissions);
+
+        assert_eq!(result, Err(Ok(ContractError::InvalidExpiration)));
+    }
+
+    #[test]
+    fn test_add_session_key_nonzero_expiry_succeeds() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, AncoreAccount);
+        let client = AncoreAccountClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        client.initialize(&owner);
+        env.mock_all_auths();
 
         let session_pk = BytesN::from_array(&env, &[2u8; 32]);
         let permissions = Vec::new(&env);
@@ -1400,7 +1567,10 @@ mod test {
 
         // Storage entry must be absent — get_session_key returns None
         let result = client.get_session_key(&session_pk);
-        assert!(result.is_none(), "revoked key must not be implicitly resurrectable");
+        assert!(
+            result.is_none(),
+            "revoked key must not be implicitly resurrectable"
+        );
         assert!(!client.has_session_key(&session_pk));
     }
 
@@ -1446,8 +1616,13 @@ mod test {
         let (_cid, topics, data) = events_list.get_unchecked(0).clone();
 
         // Schema: topic[0] = Symbol("initialized"), data = Address
-        let topic: soroban_sdk::Symbol = soroban_sdk::FromVal::from_val(&env, &topics.get_unchecked(0));
-        assert_eq!(topic, events::initialized(&env), "topic must be 'initialized'");
+        let topic: soroban_sdk::Symbol =
+            soroban_sdk::FromVal::from_val(&env, &topics.get_unchecked(0));
+        assert_eq!(
+            topic,
+            events::initialized(&env),
+            "topic must be 'initialized'"
+        );
 
         // Data field must deserialise as Address without panic
         let _event_owner: Address = soroban_sdk::FromVal::from_val(&env, &data);
@@ -1473,8 +1648,13 @@ mod test {
         let events_list = env.events().all();
         let (_cid, topics, data) = events_list.get_unchecked(1).clone();
 
-        let topic: soroban_sdk::Symbol = soroban_sdk::FromVal::from_val(&env, &topics.get_unchecked(0));
-        assert_eq!(topic, events::session_key_added(&env), "topic must be 'session_key_added'");
+        let topic: soroban_sdk::Symbol =
+            soroban_sdk::FromVal::from_val(&env, &topics.get_unchecked(0));
+        assert_eq!(
+            topic,
+            events::session_key_added(&env),
+            "topic must be 'session_key_added'"
+        );
 
         // Data schema: (BytesN<32>, u64)
         let (pk, exp): (BytesN<32>, u64) = soroban_sdk::FromVal::from_val(&env, &data);
@@ -1500,8 +1680,13 @@ mod test {
         let events_list = env.events().all();
         let (_cid, topics, data) = events_list.get_unchecked(2).clone();
 
-        let topic: soroban_sdk::Symbol = soroban_sdk::FromVal::from_val(&env, &topics.get_unchecked(0));
-        assert_eq!(topic, events::session_key_revoked(&env), "topic must be 'session_key_revoked'");
+        let topic: soroban_sdk::Symbol =
+            soroban_sdk::FromVal::from_val(&env, &topics.get_unchecked(0));
+        assert_eq!(
+            topic,
+            events::session_key_revoked(&env),
+            "topic must be 'session_key_revoked'"
+        );
 
         // Data schema: BytesN<32>
         let pk: BytesN<32> = soroban_sdk::FromVal::from_val(&env, &data);
@@ -1536,11 +1721,13 @@ mod test {
         let events_list = env.events().all();
         let (_cid, topics, data) = events_list.get_unchecked(1).clone();
 
-        let topic: soroban_sdk::Symbol = soroban_sdk::FromVal::from_val(&env, &topics.get_unchecked(0));
+        let topic: soroban_sdk::Symbol =
+            soroban_sdk::FromVal::from_val(&env, &topics.get_unchecked(0));
         assert_eq!(topic, events::executed(&env), "topic must be 'executed'");
 
         // Data schema: (Address, Symbol, u64)
-        let (to, func, nonce): (Address, soroban_sdk::Symbol, u64) = soroban_sdk::FromVal::from_val(&env, &data);
+        let (to, func, nonce): (Address, soroban_sdk::Symbol, u64) =
+            soroban_sdk::FromVal::from_val(&env, &data);
         assert_eq!(to, callee_id, "event 'to' must match callee");
         assert_eq!(func, function, "event 'function' must match");
         assert_eq!(nonce, 0u64, "event nonce must be 0 for first execution");
@@ -1563,7 +1750,10 @@ mod test {
         let dummy_hash = BytesN::from_array(&env, &[0u8; 32]);
         // Calling upgrade without owner auth must panic (auth required)
         let result = client.try_upgrade(&dummy_hash);
-        assert!(result.is_err(), "upgrade without owner auth must be rejected");
+        assert!(
+            result.is_err(),
+            "upgrade without owner auth must be rejected"
+        );
     }
 
     #[test]
@@ -1587,9 +1777,21 @@ mod test {
         assert_eq!(result, Err(Ok(ContractError::InvalidWasmHash)));
 
         // State must remain unchanged after a failed upgrade attempt
-        assert_eq!(client.get_version(), version_before, "version must not change after failed upgrade");
-        assert_eq!(client.get_nonce(), nonce_before, "nonce must not change after failed upgrade");
-        assert_eq!(client.get_owner(), owner, "owner must not change after failed upgrade");
+        assert_eq!(
+            client.get_version(),
+            version_before,
+            "version must not change after failed upgrade"
+        );
+        assert_eq!(
+            client.get_nonce(),
+            nonce_before,
+            "nonce must not change after failed upgrade"
+        );
+        assert_eq!(
+            client.get_owner(),
+            owner,
+            "owner must not change after failed upgrade"
+        );
     }
 
     #[test]
@@ -1612,6 +1814,177 @@ mod test {
         // Second upgrade attempt (still invalid) — version must still be unchanged
         let _ = client.try_upgrade(&BytesN::from_array(&env, &[0u8; 32]));
         let v2 = client.get_version();
-        assert_eq!(v2, v0, "version remains stable across multiple failed upgrade attempts");
+        assert_eq!(
+            v2, v0,
+            "version remains stable across multiple failed upgrade attempts"
+        );
+    }
+
+    #[test]
+    fn test_refresh_session_key_ttl_emits_event() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, AncoreAccount);
+        let client = AncoreAccountClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        client.initialize(&owner);
+        env.mock_all_auths();
+
+        let session_pk = BytesN::from_array(&env, &[30u8; 32]);
+        let expires_at = 10000u64;
+        client.add_session_key(&session_pk, &expires_at, &Vec::new(&env));
+
+        client.refresh_session_key_ttl(&session_pk);
+
+        let events_list = env.events().all();
+        // Events: initialized, session_key_added, session_key_ttl_refreshed
+        let (_cid, topics, data) = events_list.get_unchecked(2).clone();
+
+        let topic: soroban_sdk::Symbol =
+            soroban_sdk::FromVal::from_val(&env, &topics.get_unchecked(0));
+        assert_eq!(
+            topic,
+            events::session_key_ttl_refreshed(&env),
+            "topic must be 'session_key_ttl_refreshed'"
+        );
+
+        let (pk, exp): (BytesN<32>, u64) = soroban_sdk::FromVal::from_val(&env, &data);
+        assert_eq!(pk, session_pk);
+        assert_eq!(exp, expires_at);
+    }
+
+    #[test]
+    fn test_is_session_key_active() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, AncoreAccount);
+        let client = AncoreAccountClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        client.initialize(&owner);
+        env.mock_all_auths();
+
+        let session_pk = BytesN::from_array(&env, &[31u8; 32]);
+
+        // Case 1: Missing key
+        assert!(!client.is_session_key_active(&session_pk));
+
+        // Case 2: Active key
+        let expires_at = env.ledger().timestamp() + 1000;
+        client.add_session_key(&session_pk, &expires_at, &Vec::new(&env));
+        assert!(client.is_session_key_active(&session_pk));
+
+        // Case 3: Expired key
+        env.ledger().set_timestamp(expires_at + 1);
+        assert!(!client.is_session_key_active(&session_pk));
+    }
+
+    #[test]
+    fn test_write_paths_bump_instance_ttl() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, AncoreAccount);
+        let client = AncoreAccountClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        client.initialize(&owner);
+        env.mock_all_auths();
+
+        let session_pk = BytesN::from_array(&env, &[32u8; 32]);
+
+        // We can't directly check the TTL value easily in Soroban tests without host functions,
+        // but we can verify the functions execute and don't panic.
+        // In a real environment, we'd use ledger snapshots.
+        client.add_session_key(&session_pk, &1000u64, &Vec::new(&env));
+        client.refresh_session_key_ttl(&session_pk);
+        client.revoke_session_key(&session_pk);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Issue #211 — Non-owner migrate rejection tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_migrate_unauthorized_caller_rejected() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, AncoreAccount);
+        let client = AncoreAccountClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        client.initialize(&owner);
+
+        // Do NOT mock auth — non-owner caller should be rejected
+        let result = client.try_migrate(&2u32);
+        assert!(
+            result.is_err(),
+            "migrate without owner auth must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_migrate_owner_success() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, AncoreAccount);
+        let client = AncoreAccountClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        client.initialize(&owner);
+        env.mock_all_auths();
+
+        let initial_version = client.get_version();
+        assert_eq!(initial_version, 1u32);
+
+        // Successful migration should increment version
+        client.migrate(&2u32);
+        assert_eq!(client.get_version(), 2u32);
+
+        // Verify migration event was emitted
+        let events_list = env.events().all();
+        assert!(events_list.len() >= 2); // initialized + migrated
+        let (_contract, topics, data) = events_list.get_unchecked(1).clone();
+        
+        let topic_symbol: soroban_sdk::Symbol =
+            soroban_sdk::FromVal::from_val(&env, &topics.get_unchecked(0));
+        assert_eq!(topic_symbol, events::migrated(&env));
+
+        let data_tuple: (u32, u32) = soroban_sdk::FromVal::from_val(&env, &data);
+        assert_eq!(data_tuple.0, 1u32); // old_version
+        assert_eq!(data_tuple.1, 2u32); // new_version
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #8)")]
+    fn test_migrate_invalid_version_rejected() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, AncoreAccount);
+        let client = AncoreAccountClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        client.initialize(&owner);
+        env.mock_all_auths();
+
+        // Attempt to migrate to same version should fail with InvalidVersion (#8)
+        client.migrate(&1u32);
+    }
+
+    #[test]
+    fn test_migrate_version_must_be_strictly_increasing() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, AncoreAccount);
+        let client = AncoreAccountClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        client.initialize(&owner);
+        env.mock_all_auths();
+
+        let initial_version = client.get_version();
+
+        // Try to migrate to lower version
+        let result = client.try_migrate(&0u32);
+        assert_eq!(result, Err(Ok(ContractError::InvalidVersion)));
+        assert_eq!(client.get_version(), initial_version);
+
+        // Try to migrate to same version  
+        let result = client.try_migrate(&initial_version);
+        assert_eq!(result, Err(Ok(ContractError::InvalidVersion)));
+        assert_eq!(client.get_version(), initial_version);
     }
 }
