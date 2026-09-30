@@ -15,6 +15,7 @@
 | Document | Purpose |
 |----------|---------|
 | [System overview](architecture/OVERVIEW.md) | High-level architecture |
+| [Transaction flow](architecture/TRANSACTION_FLOW.md) | dApp, extension, vault, session key, relayer, and blockchain flow |
 
 ## Examples
 
@@ -33,6 +34,7 @@
 | [Features](user-guide/FEATURES.md) | Feature overview |
 | [FAQ](user-guide/FAQ.md) | Frequently asked questions |
 | [Troubleshooting](user-guide/TROUBLESHOOTING.md) | Common issues and fixes |
+| [Error-code troubleshooting](troubleshooting.md) | Recovery steps for common wallet and transaction errors |
 
 ## Security
 
