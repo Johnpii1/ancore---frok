@@ -110,6 +110,7 @@ export {
   isNetworkTimeoutError,
   isVaultNotFoundError,
   isContractNotFoundError,
+  isInsufficientFee,
   assertValidEd25519PublicKey,
   assertValidContractId,
   type CodedError,
