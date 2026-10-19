@@ -126,7 +126,40 @@ export function isVaultNotFoundError(
 export function isContractNotFoundError(
   error: unknown
 ): error is ErrorWithCode<'CONTRACT_NOT_FOUND' | 'CONTRACT_MISSING'> {
-  return hasErrorCode(error, ['CONTRACT_NOT_FOUND', 'CONTRACT_MISSING'] as const, 404);
+  if (error == null) return false;
+
+  const parts: string[] = [];
+  if (typeof error === 'string') {
+    parts.push(error);
+  } else if (typeof error === 'object') {
+    const candidate = error as {
+      code?: unknown;
+      name?: unknown;
+      message?: unknown;
+      data?: unknown;
+      status?: unknown;
+      statusCode?: unknown;
+    };
+    if (typeof candidate.code === 'string') parts.push(candidate.code);
+    if (typeof candidate.name === 'string') parts.push(candidate.name);
+    if (typeof candidate.message === 'string') parts.push(candidate.message);
+    if (typeof candidate.data === 'string') parts.push(candidate.data);
+    else if (candidate.data && typeof candidate.data === 'object') {
+      const data = candidate.data as { code?: unknown; name?: unknown; message?: unknown };
+      if (typeof data.code === 'string') parts.push(data.code);
+      if (typeof data.name === 'string') parts.push(data.name);
+      if (typeof data.message === 'string') parts.push(data.message);
+    }
+    if (candidate.status === 404 || candidate.statusCode === 404) return true;
+  }
+
+  const message = parts.join(' ').toLowerCase();
+  if (/unauthori[sz]ed|bad_auth|signature|forbidden/.test(message)) return false;
+  return (
+    hasErrorCode(error, ['CONTRACT_NOT_FOUND', 'CONTRACT_MISSING'] as const, 404) ||
+    (message.includes('hosterror') && message.includes('missingvalue')) ||
+    /contract (was )?not found|missing contract|contract_not_found|contract_missing/.test(message)
+  );
 }
 
 // ---------------------------------------------------------------------------
