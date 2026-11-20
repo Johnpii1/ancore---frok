@@ -6,6 +6,7 @@
 
 import {
   detectNonceDrift,
+  fetchAndIncrementNonce,
   isValidNonce,
   NonceDriftKind,
   NONCE_DRIFT_RETRY_GUIDANCE,
@@ -192,5 +193,81 @@ describe('detectNonceDrift — determinism and composability', () => {
     for (const kind of kinds) {
       expect(NONCE_DRIFT_RETRY_GUIDANCE[kind]).toBeTruthy();
     }
+  });
+});
+
+
+// ── fetchAndIncrementNonce — recovery and retry behavior ──────────────────────
+
+describe('fetchAndIncrementNonce', () => {
+  const accountAddress = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+
+  it('returns the next nonce after fetching the current on-chain nonce', async () => {
+    const fetchNonce = jest.fn().mockResolvedValue(7);
+
+    await expect(fetchAndIncrementNonce(accountAddress, fetchNonce)).resolves.toBe(8);
+    expect(fetchNonce).toHaveBeenCalledTimes(1);
+    expect(fetchNonce).toHaveBeenCalledWith(accountAddress);
+  });
+
+  it('retries InvalidNonce failures and succeeds after the nonce is resynchronized', async () => {
+    const fetchNonce = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('InvalidNonce: stale sequence'))
+      .mockRejectedValueOnce(new Error('InvalidNonce: sequence changed'))
+      .mockResolvedValueOnce(12);
+
+    await expect(
+      fetchAndIncrementNonce(accountAddress, fetchNonce, {
+        maxRetries: 2,
+        baseDelayMs: 0,
+      })
+    ).resolves.toBe(13);
+
+    expect(fetchNonce).toHaveBeenCalledTimes(3);
+    expect(fetchNonce).toHaveBeenNthCalledWith(1, accountAddress);
+    expect(fetchNonce).toHaveBeenNthCalledWith(2, accountAddress);
+    expect(fetchNonce).toHaveBeenNthCalledWith(3, accountAddress);
+  });
+
+  it('does not retry errors unrelated to InvalidNonce', async () => {
+    const error = new Error('Soroban RPC unavailable');
+    const fetchNonce = jest.fn().mockRejectedValue(error);
+
+    await expect(
+      fetchAndIncrementNonce(accountAddress, fetchNonce, {
+        maxRetries: 3,
+        baseDelayMs: 0,
+      })
+    ).rejects.toBe(error);
+
+    expect(fetchNonce).toHaveBeenCalledTimes(1);
+  });
+
+  it('rethrows the final InvalidNonce error after exhausting retries', async () => {
+    const error = new Error('InvalidNonce: sequence mismatch');
+    const fetchNonce = jest.fn().mockRejectedValue(error);
+
+    await expect(
+      fetchAndIncrementNonce(accountAddress, fetchNonce, {
+        maxRetries: 2,
+        baseDelayMs: 0,
+      })
+    ).rejects.toBe(error);
+
+    expect(fetchNonce).toHaveBeenCalledTimes(3);
+  });
+
+  it('rejects an invalid nonce returned by the fetcher without retrying', async () => {
+    const fetchNonce = jest.fn().mockResolvedValue(-1);
+
+    await expect(
+      fetchAndIncrementNonce(accountAddress, fetchNonce, {
+        maxRetries: 2,
+        baseDelayMs: 0,
+      })
+    ).rejects.toThrow('fetcher returned invalid nonce -1');
+
+    expect(fetchNonce).toHaveBeenCalledTimes(1);
   });
 });
