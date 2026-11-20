@@ -58,4 +58,4 @@ EXPOSE 3000
 #
 # Node receives SIGTERM directly as PID 1 here, which is what the graceful
 # shutdown handler in server.ts needs (#1346). Do not wrap this in a shell.
-CMD ["node", "dist/server.js"]
+CMD ["pnpm", "start"]
