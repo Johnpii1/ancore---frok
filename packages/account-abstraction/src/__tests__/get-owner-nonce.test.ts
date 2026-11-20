@@ -128,6 +128,28 @@ describe('getNonce', () => {
     expect(typeof result).toBe('number');
   });
 
+  it('returns 0 when the contract nonce is unset (default nonce)', async () => {
+    const nonceScVal = xdr.ScVal.scvU64(new xdr.Uint64(0n));
+    const server = {
+      getAccount: jest.fn().mockResolvedValue({
+        id: OWNER_ADDRESS,
+        sequence: '1',
+      }),
+      simulateTransaction: jest.fn().mockResolvedValue({
+        result: { retval: nonceScVal },
+      }),
+    } as AccountContractReadOptions['server'];
+
+    const result = await getNonce(CONTRACT_ID, {
+      server,
+      sourceAccount: OWNER_ADDRESS,
+      networkPassphrase: 'Test SDF Network ; September 2015',
+    });
+
+    expect(result).toBe(0);
+    expect(server.simulateTransaction).toHaveBeenCalledTimes(1);
+  });
+
   it('throws TypeError when contract returns unexpected type (parse error)', async () => {
     // Return an address instead of u64 to simulate unexpected type
     const unexpectedScVal = new Address(OWNER_ADDRESS).toScVal();
